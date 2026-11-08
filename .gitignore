@@ -1,0 +1,19 @@
+# 构建产物
+build/
+.swiftpm/
+xcuserdata/
+
+# 本地自签名证书与钥匙串（含私钥，绝不提交）
+.signing/
+*.pem
+*.p12
+*.key
+*.keychain
+*.keychain-db
+*.mobileprovision
+.env
+.env.*
+
+# 系统与日志
+.DS_Store
+*.log
