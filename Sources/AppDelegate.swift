@@ -12,9 +12,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !Prefs.hasShownWelcome {
             Prefs.hasShownWelcome = true
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                controller.showHelp()
                 // 列出「看不到的图标」需要辅助功能权限，看完说明后顺便申请
-                if !MenuBarScanner.isTrusted { MenuBarScanner.requestTrust() }
+                controller.showHelp {
+                    if !MenuBarScanner.isTrusted { MenuBarScanner.requestTrust() }
+                }
             }
         } else if Prefs.collapseOnLaunch {
             // 等菜单栏布局完成后再收起，否则拿不到图标位置

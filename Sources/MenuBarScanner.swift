@@ -19,7 +19,11 @@ final class MenuBarItemInfo: NSObject {
     }
 
     var bundleID: String? { app.bundleIdentifier }
-    var appIcon: NSImage? { app.icon }
+    /// 菜单里显示的图标：一般是 App 图标；输入法显示菜单栏上实际的当前输入法图标
+    @MainActor var icon: NSImage? {
+        if bundleID == InputSourceIcon.hostBundleID, let image = InputSourceIcon.current() { return image }
+        return app.icon
+    }
 
     /// 菜单里显示的名字
     var displayName: String {
@@ -27,6 +31,10 @@ final class MenuBarItemInfo: NSObject {
         guard let label, !label.isEmpty else { return appName }
         if let bundleID, systemHosts.contains(bundleID) { return label }
         if label.caseInsensitiveCompare(appName) == .orderedSame { return appName }
+        // 去掉重复：描述里已经带着 App 名字（「输入法」+「微信输入法」）只留描述，
+        // App 名字里已经包含描述（「网易有道翻译」+「有道」）只留名字。纯数字的角标（未读数）照常显示
+        if label.localizedCaseInsensitiveContains(appName) { return label }
+        if label.contains(where: \.isLetter), appName.localizedCaseInsensitiveContains(label) { return appName }
         return "\(appName) — \(label)"
     }
 }
@@ -58,6 +66,9 @@ enum MenuBarScanner {
     private static let cacheLock = NSLock()
     nonisolated(unsafe) private static var probeCache: [pid_t: Probe] = [:]
     nonisolated(unsafe) private static var lastHealScan = Date.distantPast
+    /// 拒绝读取的进程（辅助功能接口返回「已禁用」）。常见原因是 App 运行期间程序文件被替换了
+    /// （比如重新编译安装），系统核对不了它的签名，重启那个 App 就好
+    nonisolated(unsafe) private static var refusedPIDs: Set<pid_t> = []
 
     private static func cached(_ pid: pid_t) -> Probe? {
         cacheLock.lock(); defer { cacheLock.unlock() }
@@ -77,6 +88,19 @@ enum MenuBarScanner {
     private static func pruneCache(alive: Set<pid_t>) {
         cacheLock.lock(); defer { cacheLock.unlock() }
         probeCache = probeCache.filter { alive.contains($0.key) }
+        refusedPIDs.formIntersection(alive)
+    }
+
+    private static func recordRefused(_ pid: pid_t, _ refused: Bool) {
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        if refused { refusedPIDs.insert(pid) } else { refusedPIDs.remove(pid) }
+    }
+
+    /// 拒绝读取的 App 名字
+    static var refusedApps: [String] {
+        let apps = candidateApps()
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        return apps.filter { refusedPIDs.contains($0.processIdentifier) }.map { friendlyName(of: $0) }
     }
 
     static var unresponsiveApps: [String] {
@@ -130,7 +154,7 @@ enum MenuBarScanner {
     static func scan() -> [MenuBarItemInfo] {
         guard isTrusted else { return [] }
         let apps = candidateApps()
-        let windows = statusBarWindows()
+        let windows = homeRowWindows()
 
         // 快速路径：只问有图标的和没见过的。已知有图标的 App 多等一会儿（有的 App 响应慢）
         var items = query(apps.filter { app in
@@ -233,6 +257,7 @@ enum MenuBarScanner {
         var barValue: CFTypeRef?
         let error = AXUIElementCopyAttributeValue(axApp, "AXExtrasMenuBar" as CFString, &barValue)
         if error == .cannotComplete { return nil }
+        recordRefused(app.processIdentifier, error == .apiDisabled)
         guard error == .success, let barValue, CFGetTypeID(barValue) == AXUIElementGetTypeID(),
               let children = attribute(barValue as! AXUIElement, kAXChildrenAttribute) as? [AXUIElement] else { return [] }
 
@@ -271,8 +296,9 @@ enum MenuBarScanner {
 
     // MARK: - 可见性
 
-    private struct StatusWindow {
-        let frame: CGRect
+    struct StatusWindow {
+        let number: Int        // 系统窗口编号
+        let frame: CGRect      // 全局坐标，原点在主屏左上角
         let onScreen: Bool
     }
 
@@ -285,13 +311,58 @@ enum MenuBarScanner {
                   let boundsDict = info[kCGWindowBounds as String] as? NSDictionary,
                   let bounds = CGRect(dictionaryRepresentation: boundsDict) else { return nil }
             let onScreen = (info[kCGWindowIsOnscreen as String] as? Bool) ?? false
-            return StatusWindow(frame: bounds, onScreen: onScreen)
+            let number = (info[kCGWindowNumber as String] as? Int) ?? 0
+            return StatusWindow(number: number, frame: bounds, onScreen: onScreen)
         }
     }
 
-    /// 系统窗口列表里「没显示在屏幕上」的菜单栏图标数量（不需要辅助功能权限）
+    /// 箭头窗口现在的位置（全局坐标），由控制器提供。用来认出图标真正所在的那一排菜单栏
+    nonisolated(unsafe) static var toggleFrameProvider: (() -> CGRect?)?
+
+    /// 箭头所在那一排菜单栏的图标窗口，从左到右。
+    /// 接了外接显示器时，每块屏幕的菜单栏上都有一整套图标窗口。图标真正所在的只有一排：
+    /// 当前活跃的屏幕上、箭头所在的那排，辅助功能读到的位置、点击和拖动都对应这一排；
+    /// 其他屏幕上的是系统画的副本，切换屏幕后两边会对调。
+    /// 同一排的窗口首尾相接（收起时中间是拉宽的分隔线），从箭头出发往两边连着找，就不会混进副本。
+    /// 找不到箭头时退回全部窗口
+    private static func homeRowWindows() -> [StatusWindow] {
+        let all = statusBarWindows().filter { $0.frame.height <= 50 }
+        guard let toggle = toggleFrameProvider?(),
+              let anchor = all.first(where: { abs($0.frame.minX - toggle.minX) < 2 && abs($0.frame.minY - toggle.minY) < 2
+                                                && abs($0.frame.width - toggle.width) < 2 }) else { return all }
+        var row = [anchor]
+        var used: Set<Int> = [anchor.number]
+        for leftward in [true, false] {
+            var current = anchor
+            while let next = neighbor(of: current, leftward: leftward, in: all, excluding: used) {
+                used.insert(next.number)
+                if leftward { row.insert(next, at: 0) } else { row.append(next) }
+                current = next
+            }
+        }
+        return row
+    }
+
+    /// 同一排里紧挨着的下一个窗口（等高、边对边）。候选不止一个时不猜，就此停下
+    private static func neighbor(of window: StatusWindow, leftward: Bool, in windows: [StatusWindow],
+                                 excluding used: Set<Int>) -> StatusWindow? {
+        let edge = leftward ? window.frame.minX : window.frame.maxX
+        let matches = windows.filter { w in
+            !used.contains(w.number)
+                && abs(w.frame.minY - window.frame.minY) < 2 && abs(w.frame.height - window.frame.height) < 2
+                && abs((leftward ? w.frame.maxX : w.frame.minX) - edge) < 2
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    /// 诊断用：箭头那一排有几个窗口 / 一共几个（接了外接显示器时后者是前者的几倍）
+    static func homeRowSummary() -> String {
+        "\(homeRowWindows().count)/\(statusBarWindows().filter { $0.frame.height <= 50 }.count)"
+    }
+
+    /// 箭头那一排里「没显示在屏幕上」的菜单栏图标数量（不需要辅助功能权限）
     static func hiddenStatusWindowCount() -> Int {
-        hiddenStatusWindowCount(statusBarWindows())
+        hiddenStatusWindowCount(homeRowWindows())
     }
 
     /// 本 App 自己的窗口（箭头、隐形分隔线），统计时排除。由主线程在扫描前设置
@@ -327,6 +398,25 @@ enum MenuBarScanner {
     static func currentFrame(of item: MenuBarItemInfo) -> CGRect? {
         AXUIElementSetMessagingTimeout(item.element, 0.2)
         return frame(of: item.element)
+    }
+
+    /// 拖动、核对顺序用的图标窗口：排除收起时拉得很宽的隐形分隔线和挂在这一层的大面板。
+    /// 按窗口算位置比辅助功能读到的范围更准，而且窗口编号在图标挪动后不变，可以一直跟踪同一个图标
+    /// 只看箭头那一排，外接显示器上的副本不算
+    static func itemWindows() -> [StatusWindow] {
+        homeRowWindows().filter { $0.frame.width <= 400 }
+    }
+
+    /// 某个图标当前所在的窗口
+    static func itemWindow(of item: MenuBarItemInfo) -> StatusWindow? {
+        guard let frame = currentFrame(of: item) else { return nil }
+        let center = CGPoint(x: frame.midX, y: frame.midY)
+        return itemWindows().first { $0.frame.insetBy(dx: -1, dy: -1).contains(center) }
+    }
+
+    /// 窗口编号全局唯一，直接在所有窗口里找（拖动、展开的过程中那一排可能暂时没连上）
+    static func itemWindow(number: Int) -> StatusWindow? {
+        statusBarWindows().first { $0.number == number && $0.frame.height <= 50 && $0.frame.width <= 400 }
     }
 
     // MARK: - 点击

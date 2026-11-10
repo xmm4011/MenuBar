@@ -6,7 +6,9 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APP_NAME="MenuBar"
-BUILD_DIR="build"
+# 目录名以 .noindex 结尾，聚焦搜索就不会收录里面的 App，搜「MenuBar」只会出现装好的那个
+BUILD_DIR="build.noindex"
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 APP="$BUILD_DIR/$APP_NAME.app"
 SDK="$(xcrun --show-sdk-path)"
 MIN_OS="13.0"
@@ -103,6 +105,8 @@ else
   echo "==> 本地证书签名失败，改用临时签名（重新编译后需要重新授权辅助功能）"
   codesign --force --deep --sign - "$APP"
 fi
+# 也不让系统把编译出来的这份当成一个 App 登记：否则 menubar:// 链接可能被它打开
+"$LSREGISTER" -u "$APP" 2>/dev/null || true
 echo "==> 完成：$APP"
 
 if [ "${1:-}" = "install" ]; then
