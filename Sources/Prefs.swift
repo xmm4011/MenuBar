@@ -9,6 +9,7 @@ enum Prefs {
         static let hotKeyEnabled = "hotKeyEnabled"
         static let hasShownWelcome = "hasShownWelcome"
         static let clickShowsList = "clickShowsList"
+        static let separatorOffset = "separatorOffset"
     }
 
     static func registerDefaults() {
@@ -18,7 +19,15 @@ enum Prefs {
             Key.hotKeyEnabled: true,
             Key.hasShownWelcome: false,
             Key.clickShowsList: true,
+            Key.separatorOffset: 1.0,
         ])
+    }
+
+    /// 分隔图标的「偏好位置」比箭头大多少：数值越大越靠左。
+    /// 默认 1（紧挨着箭头左边），收起时如果没贴住会按实际差距自动纠正并记下来
+    static var separatorOffset: Double {
+        get { d.double(forKey: Key.separatorOffset) }
+        set { d.set(newValue, forKey: Key.separatorOffset) }
     }
 
     /// 展开后多少秒自动收起，0 表示不自动收起

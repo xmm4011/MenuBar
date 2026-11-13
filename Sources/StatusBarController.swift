@@ -27,6 +27,8 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     private var reorderTest: ReorderTest?
     private let collapsedSeparatorLength: CGFloat = 10_000
     private let maxPostpone = 30   // 用户在操作菜单栏时最多推迟 30 次 × 2 秒
+    private static let maxCollapseAttempts = 4   // 每次纠正一下位置再试
+    private static let tolerableGap: CGFloat = 200   // 箭头左边最多容忍这么宽挪不走的图标
 
     private static let toggleAutosaveName = "MenuBar.Toggle"
     private static let separatorAutosaveName = "MenuBar.Separator"
@@ -78,22 +80,54 @@ final class StatusBarController: NSObject, NSMenuDelegate {
     }
     private var toggleFrame: NSRect? { toggleItem.button?.window?.frame }
 
+    /// 分隔图标只要够宽，能把它左边的图标全都顶出屏幕就行。
+    /// 以前固定 10000，太宽会把别的 App 的可变宽度图标（比如开会时的 i讯飞）挤变形，
+    /// 所以改成「最宽那块屏幕再多一点」——左边的图标加起来不可能超过一整条菜单栏
+    private var separatorLength: CGFloat {
+        let widest = NSScreen.screens.map(\.frame.width).max() ?? 1920
+        return min(collapsedSeparatorLength, widest + 400)
+    }
+
     /// 新建分隔图标：先把它的「偏好位置」设成比箭头稍微靠左，系统就会把它放在箭头左边
-    private func placeSeparator() {
+    /// - Parameter position: 指定偏好位置（纠正重试时用）；nil 表示按箭头位置 + 记住的偏移量算
+    /// - Returns: 实际写下去的偏好位置
+    @discardableResult
+    private func placeSeparator(at position: Double? = nil) -> Double {
         removeSeparator()
         let defaults = UserDefaults.standard
         // 上次退出时分隔图标若是隐藏的，系统会记下「隐藏过」，下次新建时就不按指定位置放了，先清掉
         defaults.removeObject(forKey: "NSStatusItem VisibleCC " + Self.separatorAutosaveName)
         defaults.removeObject(forKey: "NSStatusItem Visible " + Self.separatorAutosaveName)
         let togglePosition = defaults.double(forKey: Self.positionPrefix + Self.toggleAutosaveName)
-        defaults.set(togglePosition + 1, forKey: Self.positionPrefix + Self.separatorAutosaveName)
+        let wanted = position ?? (togglePosition + Prefs.separatorOffset)
+        defaults.set(wanted, forKey: Self.positionPrefix + Self.separatorAutosaveName)
 
-        let item = NSStatusBar.system.statusItem(withLength: collapsedSeparatorLength)
+        let item = NSStatusBar.system.statusItem(withLength: separatorLength)
         item.autosaveName = Self.separatorAutosaveName
         item.button?.image = nil
         item.button?.title = ""
         item.isVisible = true
         separatorItem = item
+        return wanted
+    }
+
+    /// 分隔图标右边缘到箭头左边缘还差多少点，算不出来返回 nil
+    private func gapToToggle() -> CGFloat? {
+        guard let sep = separatorFrame, let tog = toggleFrame else { return nil }
+        let gap = NSApp.userInterfaceLayoutDirection == .rightToLeft
+            ? sep.minX - tog.maxX
+            : tog.minX - sep.maxX
+        return gap >= 0 ? gap : nil
+    }
+
+    /// 没贴住时算一个新的偏好位置：偏好位置的单位就是点，和屏幕上的距离 1:1，
+    /// 所以差多少点就把位置改多少（数值越大越靠左）。贴住了返回 nil
+    private func correctedPosition(from current: Double) -> Double? {
+        guard let sep = separatorFrame, let tog = toggleFrame else { return nil }
+        guard NSApp.userInterfaceLayoutDirection != .rightToLeft else { return nil }
+        let gap = tog.minX - sep.maxX            // > 0：分隔图标太靠左，中间夹着别的图标
+        guard abs(gap) > 3, abs(gap) < 2000 else { return nil }
+        return current - Double(gap)
     }
 
     private func removeSeparator() {
@@ -156,10 +190,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         attemptCollapse(silent: silent, attempt: 1, started: Date())
     }
 
-    /// 放分隔图标并等它贴住箭头。没贴住就再放一次；两次都不行就放弃，
-    /// 宁可不收，也不要收一半（分隔图标和箭头之间的图标会留在屏幕上）
-    private func attemptCollapse(silent: Bool, attempt: Int, started: Date) {
-        placeSeparator()
+    /// 放分隔图标并等它贴住箭头。没贴住就按实际差距纠正偏好位置再放一次，
+    /// 几次都不行就放弃，宁可不收，也不要收一半（分隔图标和箭头之间的图标会留在屏幕上）
+    private func attemptCollapse(silent: Bool, attempt: Int, position: Double? = nil, started: Date) {
+        let used = placeSeparator(at: position)
         waitUntilGlued(deadline: Date().addingTimeInterval(1.0)) { [weak self] glued in
             guard let self else { return }
             let ms = Int(Date().timeIntervalSince(started) * 1000)
@@ -174,9 +208,21 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 self.scheduleAutoCollapse()
                 return
             }
-            if !glued && attempt < 2 {
-                debugLog("collapse: not glued (sep=\(sepText)), retry")
-                self.attemptCollapse(silent: silent, attempt: attempt + 1, started: started)
+            // 有些图标系统不让挪（开会时的绿色摄像头 / 橙色麦克风指示器就是），它会一直赖在箭头左边。
+            // 纠正过一次还是贴不住、而且只差一点点，就认了：这一两个留着，别的照收，比整个收不起来强
+            if !glued, attempt >= 2, self.separatorIsLeftOfToggle(),
+               let gap = self.gapToToggle(), gap <= Self.tolerableGap {
+                debugLog("collapse: 中间夹着 \(Int(gap))pt 挪不走的图标，照收 in \(ms)ms (sep=\(sepText))")
+                self.isApplyingCollapse = false
+                self.isCollapsed = true
+                self.applyState()
+                return
+            }
+            if !glued && attempt < Self.maxCollapseAttempts {
+                // 中间夹了别的图标（比如开会时 i讯飞 那种会变宽的图标），按差距挪一下再试
+                let next = self.correctedPosition(from: used)
+                debugLog("collapse: not glued (sep=\(sepText)), retry at \(next.map { String(format: "%.0f", $0) } ?? "same")")
+                self.attemptCollapse(silent: silent, attempt: attempt + 1, position: next, started: started)
                 return
             }
             self.isApplyingCollapse = false
@@ -186,7 +232,10 @@ final class StatusBarController: NSObject, NSMenuDelegate {
                 if !silent { self.showWrongOrderAlert() }
                 return
             }
-            debugLog("collapse: glued in \(ms)ms (attempt \(attempt)) sep=\(sepText)")
+            // 记下这次成功的偏移量，下次收起直接用，不用再试
+            let togglePosition = UserDefaults.standard.double(forKey: Self.positionPrefix + Self.toggleAutosaveName)
+            Prefs.separatorOffset = min(2000, max(1, used - togglePosition))
+            debugLog("collapse: glued in \(ms)ms (attempt \(attempt)) offset=\(Int(used - togglePosition)) sep=\(sepText)")
             self.isCollapsed = true
             self.applyState()
         }
@@ -989,7 +1038,9 @@ final class StatusBarController: NSObject, NSMenuDelegate {
         showAlert(title: "暂时无法收起", message: """
         没能把收起的边界放到箭头左边。
 
-        可以按住 ⌘ 把箭头稍微拖动一下，或者退出后重新打开 MenuBar 再试。
+        正在开会 / 用摄像头麦克风时，系统那颗绿色或橙色的指示器不让挪，可能会挡住；等它消失再试。
+
+        也可以按住 ⌘ 把箭头稍微拖动一下，或者退出后重新打开 MenuBar 再试。
         """)
     }
 
